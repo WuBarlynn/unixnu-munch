@@ -447,7 +447,7 @@ kernel_args = [
   "boot-diag-resume=0",
   # Labels the diagnostic page and the live banner ("[mun-b1] ..."), so a photograph
   # names the image it came from. Change it with each tested build.
-  "sheng-build-tag=mun-b9",
+  "sheng-build-tag=mun-b10",
   # qcom-usb-debug=1 starts the CDC-ACM console over the board's DWC3 controller. It tees
   # printf, IOLog, kprintf and the panic drain onto a USB serial port, so the log can be read
   # live on the host instead of photographed off the panel. The firmware already brings the
@@ -490,7 +490,7 @@ kernel_args = [
   # SMMU leaves CBNDX 0xff in the type (pipa measured 0x000203ff on the same part); the pipa
   # branch of ArmSmmu4K, which kits/ArmSmmu4K now points at, checks only the type. The row to
   # read is "GMUCTX ..." on the console, then "GPUROW13/14".
-  "pipa-gpu=11",
+  "pipa-gpu=12",
   # "pcie=9",  # off for the first image: only the read-only step was measured on alioth
   # "pcie_skip=32",
   # Starts the HID publisher itself. The publisher is an IOHIDDevice compiled into this kernel,

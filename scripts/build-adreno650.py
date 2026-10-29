@@ -10,6 +10,12 @@ pipa-gpu=<mode>) drives these objects. No firmware is embedded here: the GMU, SQ
 import json, os, re, subprocess, sys
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
+
+def run(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode:
+        sys.exit(result.stderr[-2500:] or result.stdout[-2500:])
+    return result
 c_recipe = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/bsd_init.o.json').read_text().strip().rstrip(','))
 cxx_recipe = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json').read_text().strip().rstrip(','))
 # scripts/build-xnu-4k-baseline.sh links CONFIG_XNU_NATIVE_ADRENO from
@@ -41,6 +47,13 @@ sources += [driver / (name + '.cpp') for name in (
 # three arrays it weak-imports.
 PACKAGE = Path(os.environ.get('ADRENO650_PACKAGE', str(ROOT / 'package')))
 sources += [PACKAGE / 'GpuProbe.cpp', PACKAGE / 'GpuFirmwareA650.c', PACKAGE / 'munch_pcie.c']
+# The staged AGXAccelerator for the original Metal discovery: a direct subclass of the
+# original IOAcceleratorES, bound to this kernel's class by the structural audit below.
+# Its include is ../AdrenoMetal/OriginalAcceleratorABI.h, so drivers/AdrenoMetal is a
+# sibling submodule of the driver checkout.
+accelerator = driver / 'NativeAdrenoAccelerator.cpp'
+if accelerator.is_file():
+    sources.append(accelerator)
 objects = []
 for source in sources:
     recipe = c_recipe if source.suffix == '.c' else cxx_recipe
@@ -69,6 +82,8 @@ for source in sources:
                 '-Wno-missing-field-initializers',
                 '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
                 ]
+    if accelerator.is_file():
+        command.append('-DPIPA_GPU_ACCELERATOR=1')
     result = subprocess.run(command, cwd=recipe['directory'], capture_output=True, text=True)
     if result.returncode:
         sys.exit(str(source) + ':\n' + result.stderr[-2500:])
@@ -90,3 +105,28 @@ absent = [s for s in required if s not in defined]
 if absent:
     sys.exit('Required definitions absent: ' + ', '.join(absent))
 print('PASS: %d NativeAdreno a650 objects archived' % len(objects))
+
+if accelerator.is_file():
+    # The accelerator imports the original base's constructor, destructor and metaclass by
+    # name; IOGPUFamily's symbols are stripped from the prelink, so the audit locates the
+    # class in the image by structure (metaclass name pointer, the 168-entry vtable that
+    # differs from IOService's at 0/1/7, the bodies that install that vptr and call C2).
+    plan_path = ROOT / 'build/gpu-analysis/ioaccelerator-base-abi.json'
+    kernel = ROOT.parent / 'kernel/kernel.macho'
+    run(['python3', str(ROOT / 'scripts/audit-munch-accelerator-base.py'), str(kernel), str(plan_path)])
+    plan = json.loads(plan_path.read_text())
+    bindings = {'__ZN15IOAcceleratorESC2EPK11OSMetaClass': int(plan['protected_compatible_constructor_aliases'][0], 16),
+                '__ZN15IOAcceleratorESD2Ev': int(plan['nondeleting_destructor'], 16),
+                '__ZN15IOAcceleratorES10gMetaClassE': int(plan['metaclass'], 16)}
+    asm = out / 'original-bindings.S'
+    asm.write_text(''.join('.globl %s\n.set %s, %#x\n' % (name, name, address)
+                           for name, address in sorted(bindings.items())))
+    sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
+    run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk, '-c', str(asm), '-o', str(out / 'original-bindings.o')])
+    llvm = Path(subprocess.check_output(['brew', '--prefix', 'llvm'], text=True).strip()) / 'bin'
+    late = out / 'NativeAdrenoAccelerator.late.o'
+    run([str(llvm / 'llvm-objcopy'), '--remove-section=__DATA,__mod_init_func',
+         '--globalize-symbol=__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp',
+         str(out / 'NativeAdrenoAccelerator.o'), str(late)])
+    run(['xcrun', 'ar', 'rcs', str(archive), str(late), str(out / 'original-bindings.o')])
+    print('PASS: staged AGXAccelerator appended with bindings', {k: hex(v) for k, v in bindings.items()})
