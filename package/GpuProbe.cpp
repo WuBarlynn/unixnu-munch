@@ -1013,7 +1013,7 @@ bool zapLoad() {
     }
     z[12] = relocate; z[13] = int32_t(hi - lo);
     if (lo >= hi || hi - lo > kZapBytes) return stop(-5);
-    const uint64_t ehdr = ph(0, 4), hashBytes = ph(hash, 4), hashOff = ph(hash, 1);
+    const uint64_t ehdr = ph(0, 4), hashBytes = ph(hash, 4);
     /* The array holds the vendor zap.mdt followed by the b02, without the page padding of the
      * vendor .elf: [ELF header and program headers][hash segment][code], dense. The program
      * headers keep the padded file offsets (0x1000, 0x3000) because TrustZone validates them
