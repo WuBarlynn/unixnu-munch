@@ -117,6 +117,25 @@ def main():
             imm -= 1 << 33
         return (pc & ~0xfff) + imm
 
+    def adr_target(pc, word):
+        imm = (((word >> 5) & 0x7ffff) << 2) | ((word >> 29) & 3)
+        if imm & (1 << 20):
+            imm -= 1 << 21
+        return pc + imm
+
+    def materialised(data, va, at):
+        """(pc, target) for an ADR at at, or an ADRP+ADD pair starting at at."""
+        word = int.from_bytes(data[at:at + 4], 'little')
+        if word & 0x9f000000 == 0x10000000:
+            yield va + at, adr_target(va + at, word)
+        if word & 0x9f00001f == 0x90000000:
+            page = adrp_target(va + at, word)
+            for j in range(at + 4, min(at + 20, len(data) - 4), 4):
+                second = int.from_bytes(data[j:j + 4], 'little')
+                if second & 0xffc00000 == 0x91000000:
+                    yield va + at, page + ((second >> 10) & 4095)
+                    break
+
     def getter_target(getter):
         # getMetaClass returns the address of the class's gMetaClass object. The compiler
         # either computes it with adrp/add or, when it constant-folds, materializes it with
@@ -125,6 +144,8 @@ def main():
         constant, register = None, None
         for i in range(0, 60, 4):
             word = int.from_bytes(code[i:i + 4], 'little')
+            if word & 0x9f000000 == 0x10000000 and (word & 0x1f) == 0:
+                return adr_target(getter + i, word)
             if word & 0x9f00001f == 0x90000000:
                 page, rd = adrp_target(getter + i, word), word & 0x1f
                 for j in range(i + 4, min(i + 20, 60), 4):
@@ -163,26 +184,16 @@ def main():
         va = segment['va']
         for at in range(0, len(data) - 24, 4):
             word = int.from_bytes(data[at:at + 4], 'little')
-            if word & 0x9f00001f == 0x90000000:
-                page = adrp_target(va + at, word)
-                for j in range(at + 4, min(at + 24, len(data) - 4), 4):
-                    second = int.from_bytes(data[j:j + 4], 'little')
-                    if second & 0xffc00000 == 0x91000000:
-                        target = page + ((second >> 10) & 4095)
-                        if target in string_vas:
-                            # The constructor function references the metaclass nearby.
-                            lo, hi = max(0, at - 192), min(len(data) - 24, at + 192)
-                            for k in range(lo, hi, 4):
-                                w2 = int.from_bytes(data[k:k + 4], 'little')
-                                if w2 & 0x9f00001f == 0x90000000:
-                                    page2 = adrp_target(va + k, w2)
-                                    for m in range(k + 4, min(k + 24, len(data) - 4), 4):
-                                        s2 = int.from_bytes(data[m:m + 4], 'little')
-                                        if s2 & 0xffc00000 == 0x91000000:
-                                            t2 = page2 + ((s2 >> 10) & 4095)
-                                            if is_data(t2) and t2 not in string_vas:
-                                                metaclass_candidates.add(t2)
-                        break
+            if word & 0x9f00001f != 0x90000000 and word & 0x9f000000 != 0x10000000:
+                continue
+            if not any(target in string_vas for _, target in materialised(data, va, at)):
+                continue
+            # The constructor function references the metaclass nearby.
+            lo, hi = max(0, at - 192), min(len(data) - 24, at + 192)
+            for k in range(lo, hi, 4):
+                for _, t2 in materialised(data, va, k):
+                    if is_data(t2) and t2 not in string_vas:
+                        metaclass_candidates.add(t2)
     # How the code reaches the strings at all: every adrp/add target in the same 4 KiB page
     # as a class-name occurrence, so a different reference form or a different copy shows.
     for string_va in string_vas:
@@ -194,19 +205,9 @@ def main():
             data = raw[segment['fileoff']:segment['fileoff'] + segment['filesize']]
             va = segment['va']
             for at in range(0, len(data) - 24, 4):
-                word = int.from_bytes(data[at:at + 4], 'little')
-                if word & 0x9f00001f != 0x90000000:
-                    continue
-                page_base = adrp_target(va + at, word)
-                if page_base != page:
-                    continue
-                for j in range(at + 4, min(at + 24, len(data) - 4), 4):
-                    second = int.from_bytes(data[j:j + 4], 'little')
-                    if second & 0xffc00000 == 0x91000000:
-                        target = page_base + ((second >> 10) & 4095)
-                        if page <= target < page + 0x1000:
-                            refs.append((va + at, target))
-                        break
+                for pc, target in materialised(data, va, at):
+                    if page <= target < page + 0x1000:
+                        refs.append((pc, target))
         print(f'  string {string_va:#x}: {len(refs)} reference(s) into its page' +
               ('' if not refs else ': ' + ', '.join(f'{pc:#x}->{target - string_va:+#x}' for pc, target in refs[:8])))
     print('metaclass candidates from class-name references: ' +
