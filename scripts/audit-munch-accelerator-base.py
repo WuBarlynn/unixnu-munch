@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """Derive the original IOAcceleratorES ABI from the linked kernel by structure.
 
-The prelink strips IOGPUFamily's symbols, so the class cannot be looked up by
-name in the kernel's symbol table. It is located by the same facts the runtime
-audit of the sheng kernel observed, read from the image instead of memory:
+The prelink strips IOGPUFamily's symbols, so nothing can be looked up by name.
+The class is located by the facts that do not depend on any private layout:
 
-  * the metaclass object names it: a data word that points at the string
-    "IOAcceleratorES" 24 bytes into the object, with the 136-byte instance size
-    at +32;
-  * the vtable is the 168-entry table that matches IOService's own table except
-    at slots 0, 1 and 7 (the destructor pair and the metaclass getter), and its
-    typeinfo names the class;
+  * the vtable is the 168-entry table that matches IOService's own except at
+    slots 0, 1 and 7, and whose typeinfo names the class;
+  * slot 0 is the non-deleting destructor and slot 7 is getMetaClass, whose body
+    computes the metaclass object (an adrp/add pair), so the metaclass address
+    comes from that code rather than from a guessed field offset;
   * the constructors are the bodies that install that vptr in [x0], call
     IOService's C2 and return through the ordinary frame epilogue.
 
-The output is the plan build-adreno740-accelerator.py consumes, with this
-kernel's addresses. It is a check of the image, not a runtime observation:
-runtime_qualified stays false until a booted kernel confirms it.
+Run standalone to inspect a kernel:
+
+    python3 scripts/audit-munch-accelerator-base.py KERNEL [OUT.json]
+
+Diagnostics are printed before any check fails, so a layout difference shows
+what the image actually holds.
 """
 import hashlib
 import json
@@ -47,34 +48,34 @@ def main():
         for name in group:
             names.setdefault(name, address)
 
-    def backed(address, length):
+    def file_offset(address):
         for segment in image['segments']:
-            if segment['va'] <= address and address + length <= segment['va'] + segment['filesize']:
-                at = segment['fileoff'] + address - segment['va']
-                require(at + length <= len(raw), f'unbacked read at {address:#x}')
-                return raw[at:at + length]
-        raise SystemExit(f'{address:#x}+{length:#x} is not file-backed')
+            if segment['va'] <= address < segment['va'] + segment['filesize']:
+                return segment['fileoff'] + address - segment['va']
+        return None
+
+    def backed(address, length):
+        at = file_offset(address)
+        require(at is not None and at + length <= len(raw), f'unbacked read at {address:#x}')
+        return raw[at:at + length]
 
     def qword(address):
         return int.from_bytes(backed(address, 8), 'little')
 
-    def cstring(address):
-        end = raw.find(b'\0', backed_offset(address))
-        require(end >= 0, f'unterminated string at {address:#x}')
-        return raw[backed_offset(address):end]
+    def u32(address):
+        return int.from_bytes(backed(address, 4), 'little')
 
-    def backed_offset(address):
-        for segment in image['segments']:
-            if segment['va'] <= address < segment['va'] + segment['filesize']:
-                return segment['fileoff'] + address - segment['va']
-        raise SystemExit(f'{address:#x} is not file-backed')
+    def cstring(address):
+        at = file_offset(address)
+        require(at is not None, f'unbacked string at {address:#x}')
+        end = raw.find(b'\0', at)
+        return raw[at:end]
 
     vptr_ioservice = names.get('__ZTV9IOService')
     c2 = names.get('__ZN9IOServiceC2EPK11OSMetaClass') or names.get('__ZN9IOServiceC1EPK11OSMetaClass')
     require(vptr_ioservice and c2, 'IOService vtable/C2 are not in the kernel symbol table')
     base = backed(vptr_ioservice + 16, VIRTUAL_ENTRIES * 8)
 
-    # The class-name string, once per occurrence in a backed segment.
     string_vas = []
     at = raw.find(CLASS + b'\0')
     while at >= 0:
@@ -82,60 +83,87 @@ def main():
             if segment['fileoff'] <= at < segment['fileoff'] + segment['filesize']:
                 string_vas.append(segment['va'] + at - segment['fileoff'])
         at = raw.find(CLASS + b'\0', at + 1)
+    print(f'class string: {len(string_vas)} occurrence(s) at ' + ', '.join(hex(v) for v in string_vas))
     require(string_vas, 'the class-name string is not in the kernel image')
 
-    metaclasses = []
+    # Where the class string is referenced from data, with the surrounding words. The
+    # metaclass-private layout differs between builds, so this is reported, not assumed.
     for string_va in string_vas:
         needle = string_va.to_bytes(8, 'little')
         at = raw.find(needle)
         while at >= 0:
-            if at + 12 <= len(raw) and int.from_bytes(raw[at + 8:at + 12], 'little') == INSTANCE_BYTES:
-                for segment in image['segments']:
-                    if segment['fileoff'] <= at - 24 < segment['fileoff'] + segment['filesize']:
-                        metaclasses.append(segment['va'] + at - 24 - segment['fileoff'])
+            segment = next((s for s in image['segments']
+                            if s['fileoff'] <= at < s['fileoff'] + s['filesize']), None)
+            if segment:
+                va = segment['va'] + at - segment['fileoff']
+                context = raw[max(0, at - 40):at + 40]
+                print(f'  name pointer at {va:#x}: ' + context.hex())
             at = raw.find(needle, at + 1)
-    require(len(metaclasses) == 1, f'expected one IOAcceleratorES metaclass object, found {len(metaclasses)}')
-    metaclass = metaclasses[0]
-    require(qword(metaclass + 24) in string_vas, 'metaclass name pointer does not point at the class string')
 
-    # The vtable: IOService's entries except 0, 1 and 7, tied to the class by its typeinfo name.
-    tables = []
+    tables, loose = [], []
     for segment in image['segments']:
         for section in segment['sections']:
             if section['name'] != '__const' or section['size'] < VIRTUAL_ENTRIES * 8:
                 continue
             data = raw[section['fileoff']:section['fileoff'] + section['size']]
-            at = 0
-            while at + VIRTUAL_ENTRIES * 8 <= len(data):
+            for at in range(0, len(data) - VIRTUAL_ENTRIES * 8 + 1, 8):
                 window = data[at:at + VIRTUAL_ENTRIES * 8]
-                if (window[16:56] == base[16:56] and window[64:] == base[64:] and window[0:8] != base[0:8]
-                        and window[8:16] != base[8:16] and window[56:64] != base[56:64]):
-                    address = section['va'] + at
-                    try:
-                        typeinfo = qword(address + 8)
-                        name_at = qword(typeinfo + 8)
-                        if CLASS in cstring(name_at):
-                            tables.append(address)
-                    except SystemExit:
-                        pass
-                at += 8
-    require(len(tables) == 1, f'expected one IOAcceleratorES vtable, found {len(tables)}')
+                if not (window[16:56] == base[16:56] and window[64:] == base[64:]
+                        and window[0:8] != base[0:8] and window[8:16] != base[8:16]
+                        and window[56:64] != base[56:64]):
+                    continue
+                address = section['va'] + at
+                loose.append(address)
+                try:
+                    typeinfo = qword(address + 8)
+                    name = cstring(qword(typeinfo + 8))
+                except SystemExit:
+                    continue
+                if CLASS in name:
+                    tables.append(address)
+                else:
+                    print(f'  vtable-like table at {address:#x}: typeinfo names {name!r}')
+    print(f'vtable scan: {len(loose)} table(s) differ from IOService at 0/1/7, '
+          f'{len(tables)} named {CLASS.decode()}')
+    require(len(tables) == 1, f'expected one {CLASS.decode()} vtable, found {len(tables)}')
     vptr = tables[0]
     entries = [qword(vptr + 16 + i * 8) for i in range(VIRTUAL_ENTRIES)]
-    require(entries[7] != int.from_bytes(base[56:64], 'little'), 'slot 7 is not overridden')
+    print(f'vtable {vptr:#x}: D2 {entries[0]:#x} D1 {entries[1]:#x} getMetaClass {entries[7]:#x}')
 
-    # Constructors: prologue, vptr store, call to IOService C2, ordinary frame epilogue.
-    def branch_target(pc, word):
-        offset = word & 0x3ffffff
-        if offset & (1 << 25):
-            offset -= 1 << 26
-        return pc + offset * 4
-
+    # getMetaClass computes the metaclass object with adrp/add; decode until the pair is
+    # found. If it never appears, fall back to the name-pointer neighbourhood.
     def adrp_target(pc, word):
         imm = ((word >> 5) & 0x7ffff) * 4096 + ((word >> 29) & 3) * 4096
         if imm & (1 << 32):
             imm -= 1 << 33
         return (pc & ~0xfff) + imm
+
+    getter = entries[7]
+    metaclass = None
+    code = backed(getter, 40)
+    for i in range(0, 36, 4):
+        word = int.from_bytes(code[i:i + 4], 'little')
+        if word & 0x9f00001f == 0x90000000:
+            for j in range(i + 4, min(i + 16, 36), 4):
+                second = int.from_bytes(code[j:j + 4], 'little')
+                if second & 0xffc003ff == 0x91000000:
+                    metaclass = adrp_target(getter + i, word) + ((second >> 10) & 4095)
+                    break
+        if metaclass is not None:
+            break
+    print(f'getMetaClass body: {"no adrp/add pair" if metaclass is None else hex(metaclass)}')
+    if metaclass is not None:
+        try:
+            print(f'  metaclass {metaclass:#x}: ' +
+                  ', '.join(f'+{o:#x}={qword(metaclass + o):#x}' for o in (0, 8, 16, 24, 32)))
+        except SystemExit as error:
+            print(f'  metaclass read: {error}')
+
+    def branch_target(pc, word):
+        offset = word & 0x3ffffff
+        if offset & (1 << 25):
+            offset -= 1 << 26
+        return pc + offset * 4
 
     constructors = []
     for segment in image['segments']:
@@ -144,12 +172,11 @@ def main():
         data = raw[segment['fileoff']:segment['fileoff'] + segment['filesize']]
         va = segment['va']
         for at in range(0, len(data) - 128, 4):
-            w0 = int.from_bytes(data[at:at + 4], 'little')
-            w1 = int.from_bytes(data[at + 4:at + 8], 'little')
-            if not (w0 == 0xa9bf7bfd and w1 == 0x910003fd):
+            if int.from_bytes(data[at:at + 4], 'little') != 0xa9bf7bfd:
+                continue
+            if int.from_bytes(data[at + 4:at + 8], 'little') != 0x910003fd:
                 continue
             window = data[at:at + 128]
-            # ldp x29,x30,[sp],#16 followed by ret, as one little-endian 8-byte word pair.
             epilogue = any(int.from_bytes(window[i:i + 8], 'little') == (0xd65f03c0 << 32) | 0xa8c17bfd
                            for i in range(0, 112, 4))
             sc2 = any(int.from_bytes(window[i:i + 4], 'little') >> 26 == 0x25 and
@@ -160,8 +187,10 @@ def main():
                          for i in range(0, 124, 4))
             if epilogue and sc2 and stores:
                 constructors.append(va + at)
-    require(constructors, 'no IOAcceleratorES constructor found')
     constructors.sort()
+    print(f'constructors calling IOService C2 with a vptr store: {[hex(c) for c in constructors]}')
+    require(constructors, 'no IOAcceleratorES constructor found')
+    require(metaclass is not None, 'no metaclass address derived from getMetaClass')
 
     plan = {
         'kernel_sha256': hashlib.sha256(raw).hexdigest(),
