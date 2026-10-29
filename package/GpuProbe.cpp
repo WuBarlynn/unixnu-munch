@@ -1014,13 +1014,21 @@ bool zapLoad() {
     z[12] = relocate; z[13] = int32_t(hi - lo);
     if (lo >= hi || hi - lo > kZapBytes) return stop(-5);
     const uint64_t ehdr = ph(0, 4), hashBytes = ph(hash, 4), hashOff = ph(hash, 1);
-    if (ehdr > size || hashOff + hashBytes > size || ehdr + hashBytes > 0x4000) return stop(-6);
+    /* The vendor zap.mdt is stored in this array without its page padding: the bytes are
+     * [ELF header and program headers][hash segment][loadable segments], dense. The program
+     * headers keep their padded file offsets (0x1000 for the hash, 0x3000 for the segment)
+     * because TrustZone validates them as signed; rewriting them to the dense offsets makes
+     * init_image answer 0xffcfffbb, the "failed to validate firmware metadata" value a QFIL
+     * log shows for the same SMC id, which is how this was measured on 2026-10-29. The hash
+     * is therefore read from its dense position here and placed at its p_offset in the
+     * metadata buffer, and the loadable segments are walked densely below. */
+    if (ehdr > size || ehdr + hashBytes > size || ehdr + hashBytes > 0x4000) return stop(-6);
     // Metadata: physically contiguous, written back to the point of coherency (Linux: dma_alloc_coherent, below 4 GiB). XNU's
     // memory on pipa starts at 0xffc20000 and almost none of it lies below 4 GiB (2026-10-24: a below-4-GiB allocation failed,
     // after a search that may have held the boot back), so any address below 2^40: the SMC64 call carries it in full, and
     // TrustZone answers init_image with an error if it refuses it.
     z[0] = 2;
-    const size_t metaBytes = size_t((ehdr + hashBytes + 0xfff) & ~0xfffull);
+    const size_t metaBytes = size_t((hashOff + hashBytes + 0xfff) & ~0xfffull);
     gZapMeta = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
         kernel_task, static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous),
         metaBytes, 0xFFFFFFF000ULL);
@@ -1030,7 +1038,8 @@ bool zapLoad() {
     z[15] = int32_t(metaPhys >> 12);   // the metadata's page number, for the row
     if (!meta || !metaPhys) return stop(-8);
     for (uint64_t i = 0; i < ehdr; ++i) meta[i] = fw[i];
-    for (uint64_t i = 0; i < hashBytes; ++i) meta[ehdr + i] = fw[hashOff + i];
+    for (uint64_t i = ehdr; i < hashOff; ++i) meta[i] = 0;                    // the page padding the array dropped
+    for (uint64_t i = 0; i < hashBytes; ++i) meta[hashOff + i] = fw[ehdr + i];
     cleanToPoc(meta, metaBytes);
     // qcom_scm_pas_init_image: ARGS(2, VAL, RW).
     z[0] = 3; native_gpu_step = 131;
@@ -1055,12 +1064,16 @@ bool zapLoad() {
         if (!map) return stop(-9);
         volatile uint8_t *region = reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());
         const uint64_t base = relocate ? lo : kZapPhys;
+        // Dense storage: the loadable segments follow the hash segment in program-header
+        // order, so their data position comes from that walk, not from p_offset.
+        uint64_t dense = ehdr + hashBytes;
         for (unsigned i = 0; i < phnum; ++i) {
             if (ph(i, 0) != 1 || ((ph(i, 6) >> 24) & 7) == 2 || !ph(i, 5)) continue;
-            const uint64_t at = uint64_t(ph(i, 3)) - base, file = ph(i, 4), mem = ph(i, 5), off = ph(i, 1);
-            if (ph(i, 3) < base || at + mem > kZapBytes || file > mem || off + file > size) return stop(-10);
-            for (uint64_t b = 0; b < file; ++b) region[at + b] = fw[off + b];
+            const uint64_t at = uint64_t(ph(i, 3)) - base, file = ph(i, 4), mem = ph(i, 5);
+            if (ph(i, 3) < base || at + mem > kZapBytes || file > mem || dense + file > size) return stop(-10);
+            for (uint64_t b = 0; b < file; ++b) region[at + b] = fw[dense + b];
             for (uint64_t b = file; b < mem; ++b) region[at + b] = 0;
+            dense += file;
         }
         __asm__ volatile("dsb sy" ::: "memory");
     }   // the CPU view is gone before TrustZone takes the region

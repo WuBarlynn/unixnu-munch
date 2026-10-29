@@ -3067,20 +3067,20 @@ const uint8_t native_gpu_sqe_firmware[] = {
 };
 const uint32_t native_gpu_sqe_firmware_size = 31632;
 
-// zap.mdt + zap.b02 concatenated. The vendor mdt was stored without its page padding
-// (6860 = 148-byte ELF header and program headers + 6712 bytes of hash segment), but the
-// program headers kept the padded file offsets 0x1000 and 0x3000. They are corrected here
-// to the real layout: the hash segment at 148 (its data starts with the hash table, and
-// 0x1000 is 0xFF fill) and the loadable segment at 6860 (ARM64 instructions, the b02).
-// The probe's zap loader refuses the uncorrected image at step -6
-// (hashOff + hashBytes > size); with the correction both segments lie inside the array.
+// zap.mdt + zap.b02, stored densely: [ELF header and 3 program headers 148 B][hash segment
+// 6712 B][b02 1676 B]. The program headers keep the padded file offsets of the original
+// vendor mdt (0x1000 for the hash, 0x3000 for the b02) because TrustZone validates them as
+// signed data; GpuProbe's zap loader reads the segments from the dense positions and builds
+// the metadata buffer with the hash at its p_offset. Rewriting the offsets to the dense
+// positions makes pas_init_image answer 0xffcfffbb ("failed to validate firmware
+// metadata"), measured on hardware on 2026-10-29.
 const uint8_t native_gpu_zap_firmware[] = {
 127,69,76,70,1,1,1,0,0,0,0,0,0,0,0,0,2,0,164,0,1,0,0,0,
 0,80,0,0,52,0,0,0,0,0,0,0,3,0,0,0,52,0,32,0,3,0,0,0,
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,148,0,0,0,
-0,0,0,0,0,0,0,7,0,0,0,0,0,0,0,0,148,0,0,0,0,96,0,0,
+0,0,0,0,0,0,0,7,0,0,0,0,0,0,0,0,0,16,0,0,0,96,0,0,
 0,96,0,0,56,26,0,0,0,32,0,0,0,0,32,2,0,16,0,0,1,0,0,0,
-204,26,0,0,0,80,0,0,0,80,0,0,140,6,0,0,140,6,0,0,7,0,0,8,
+0,48,0,0,0,80,0,0,0,80,0,0,140,6,0,0,140,6,0,0,7,0,0,8,
 0,0,16,0,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0,144,25,0,0,
 144,0,0,0,255,255,255,255,0,1,0,0,255,255,255,255,0,24,0,0,0,0,0,0,
 120,0,0,0,0,0,0,0,0,0,0,0,20,0,0,0,0,0,0,0,114,0,0,0,
