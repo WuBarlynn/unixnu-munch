@@ -4,11 +4,13 @@
 The prelink strips IOGPUFamily's symbols, so nothing can be looked up by name.
 The class is located by the facts that do not depend on any private layout:
 
-  * the vtable is the 168-entry table that matches IOService's own except at
-    slots 0, 1 and 7, and whose typeinfo names the class;
-  * slot 0 is the non-deleting destructor and slot 7 is getMetaClass, whose body
-    computes the metaclass object (an adrp/add pair), so the metaclass address
-    comes from that code rather than from a guessed field offset;
+  * the candidate vtables are the 168-entry tables that override both slot 0
+    and slot 7 to executable code; slot 0 is the non-deleting destructor and
+    slot 7 is getMetaClass, whose body computes the metaclass object, so the
+    metaclass address comes from that code rather than a guessed field offset;
+  * the class is tied to a candidate because one function both computes the
+    metaclass address and references the class-name string (the prelink strips
+    the symbols and this kernel stores the name in code, not in data);
   * the constructors are the bodies that install that vptr in [x0], call
     IOService's C2 and return through the ordinary frame epilogue.
 
@@ -105,7 +107,34 @@ def main():
                 print(f'  name pointer at {va:#x}: ' + context.hex())
             at = raw.find(needle, at + 1)
 
-    tables, loose = [], []
+    # Candidate vtables: 168 entries, slots 2..6 equal IOService's, slots 0 and 7
+    # (destructor pair and getMetaClass) overridden. Any further overrides are allowed and
+    # reported: IOAcceleratorES itself is expected to have none, but this build's class may.
+    def adrp_target(pc, word):
+        imm = ((word >> 5) & 0x7ffff) * 4096 + ((word >> 29) & 3) * 4096
+        if imm & (1 << 32):
+            imm -= 1 << 33
+        return (pc & ~0xfff) + imm
+
+    def getter_target(getter):
+        code = backed(getter, 40)
+        for i in range(0, 36, 4):
+            word = int.from_bytes(code[i:i + 4], 'little')
+            if word & 0x9f00001f != 0x90000000:
+                continue
+            for j in range(i + 4, min(i + 16, 36), 4):
+                second = int.from_bytes(code[j:j + 4], 'little')
+                if second & 0xffc003ff == 0x91000000:
+                    return adrp_target(getter + i, word) + ((second >> 10) & 4095)
+        return None
+
+    text_ranges = [(s['va'], s['va'] + s['filesize']) for s in image['segments']
+                   if s['name'] == '__TEXT_EXEC']
+
+    def executable(address):
+        return any(lo <= address < hi for lo, hi in text_ranges)
+
+    candidates = []
     for segment in image['segments']:
         for section in segment['sections']:
             if section['name'] != '__const' or section['size'] < VIRTUAL_ENTRIES * 8:
@@ -113,56 +142,57 @@ def main():
             data = raw[section['fileoff']:section['fileoff'] + section['size']]
             for at in range(0, len(data) - VIRTUAL_ENTRIES * 8 + 1, 8):
                 window = data[at:at + VIRTUAL_ENTRIES * 8]
-                if not (window[16:56] == base[16:56] and window[64:] == base[64:]
-                        and window[0:8] != base[0:8] and window[8:16] != base[8:16]
-                        and window[56:64] != base[56:64]):
+                if window[0:8] == base[0:8] or window[56:64] == base[56:64]:
                     continue
-                address = section['va'] + at
-                loose.append(address)
-                try:
-                    typeinfo = qword(address + 8)
-                    name = cstring(qword(typeinfo + 8))
-                except SystemExit:
+                if not (executable(int.from_bytes(window[0:8], 'little')) and
+                        executable(int.from_bytes(window[56:64], 'little'))):
                     continue
-                if CLASS in name:
-                    tables.append(address)
-                else:
-                    print(f'  vtable-like table at {address:#x}: typeinfo names {name!r}')
-    print(f'vtable scan: {len(loose)} table(s) differ from IOService at 0/1/7, '
-          f'{len(tables)} named {CLASS.decode()}')
-    require(len(tables) == 1, f'expected one {CLASS.decode()} vtable, found {len(tables)}')
-    vptr = tables[0]
-    entries = [qword(vptr + 16 + i * 8) for i in range(VIRTUAL_ENTRIES)]
-    print(f'vtable {vptr:#x}: D2 {entries[0]:#x} D1 {entries[1]:#x} getMetaClass {entries[7]:#x}')
+                candidates.append(section['va'] + at)
+    print(f'vtable candidates (0 and 7 overridden, both executable): {len(candidates)}')
+    print('  ' + ', '.join(hex(c) for c in candidates[:24]) + (' ...' if len(candidates) > 24 else ''))
+    require(candidates, 'no vtable candidate found')
 
-    # getMetaClass computes the metaclass object with adrp/add; decode until the pair is
-    # found. If it never appears, fall back to the name-pointer neighbourhood.
-    def adrp_target(pc, word):
-        imm = ((word >> 5) & 0x7ffff) * 4096 + ((word >> 29) & 3) * 4096
-        if imm & (1 << 32):
-            imm -= 1 << 33
-        return (pc & ~0xfff) + imm
-
-    getter = entries[7]
-    metaclass = None
-    code = backed(getter, 40)
-    for i in range(0, 36, 4):
-        word = int.from_bytes(code[i:i + 4], 'little')
-        if word & 0x9f00001f == 0x90000000:
-            for j in range(i + 4, min(i + 16, 36), 4):
-                second = int.from_bytes(code[j:j + 4], 'little')
+    # Each candidate's getMetaClass computes its metaclass object. The class name is not a
+    # stored pointer in this kernel (the metaclass private object is built at run time), so a
+    # candidate belongs to IOAcceleratorES when one function both computes the metaclass
+    # address and references the class-name string.
+    metas = {}
+    for table in candidates:
+        getter = qword(table + 16 + 7 * 8)
+        metas[table] = getter_target(getter)
+    targets = set(string_vas) | {m for m in metas.values() if m}
+    hits = {t: [] for t in targets}
+    for segment in image['segments']:
+        if segment['name'] != '__TEXT_EXEC':
+            continue
+        data = raw[segment['fileoff']:segment['fileoff'] + segment['filesize']]
+        va = segment['va']
+        for at in range(0, len(data) - 24, 4):
+            word = int.from_bytes(data[at:at + 4], 'little')
+            if word & 0x9f00001f != 0x90000000:
+                continue
+            base_va = adrp_target(va + at, word)
+            for j in range(at + 4, at + 20, 4):
+                second = int.from_bytes(data[j:j + 4], 'little')
                 if second & 0xffc003ff == 0x91000000:
-                    metaclass = adrp_target(getter + i, word) + ((second >> 10) & 4095)
-                    break
-        if metaclass is not None:
-            break
-    print(f'getMetaClass body: {"no adrp/add pair" if metaclass is None else hex(metaclass)}')
-    if metaclass is not None:
-        try:
-            print(f'  metaclass {metaclass:#x}: ' +
-                  ', '.join(f'+{o:#x}={qword(metaclass + o):#x}' for o in (0, 8, 16, 24, 32)))
-        except SystemExit as error:
-            print(f'  metaclass read: {error}')
+                    target = base_va + ((second >> 10) & 4095)
+                    if target in hits:
+                        hits[target].append(va + at)
+    named = []
+    for table, meta in metas.items():
+        refs = hits.get(meta, []) if meta else []
+        strings = [s for s in string_vas if any(abs(pc - r) <= 128 for r in refs for pc in hits.get(s, []))]
+        print(f'  table {table:#x}: metaclass {meta if meta is None else hex(meta)}, '
+              f'{len(refs)} code reference(s), class-name match: {[hex(s) for s in strings]}')
+        if strings:
+            named.append((table, meta, strings[0]))
+    require(len(named) == 1, f'expected one candidate tied to the class name, found {len(named)}')
+    vptr, metaclass, named_string = named[0]
+    entries = [qword(vptr + 16 + i * 8) for i in range(VIRTUAL_ENTRIES)]
+    overrides = [i for i in range(VIRTUAL_ENTRIES)
+                 if entries[i] != int.from_bytes(base[i * 8:(i + 1) * 8], 'little')]
+    print(f'vtable {vptr:#x}: D2 {entries[0]:#x} D1 {entries[1]:#x} getMetaClass {entries[7]:#x} '
+          f'overrides {overrides}')
 
     def branch_target(pc, word):
         offset = word & 0x3ffffff
@@ -195,7 +225,6 @@ def main():
     constructors.sort()
     print(f'constructors calling IOService C2 with a vptr store: {[hex(c) for c in constructors]}')
     require(constructors, 'no IOAcceleratorES constructor found')
-    require(metaclass is not None, 'no metaclass address derived from getMetaClass')
 
     plan = {
         'kernel_sha256': hashlib.sha256(raw).hexdigest(),
@@ -204,7 +233,7 @@ def main():
         'instance_bytes': INSTANCE_BYTES,
         'virtual_entries': VIRTUAL_ENTRIES,
         'operational_overrides': [],
-        'metadata_overrides': [0, 1, 7],
+        'metadata_overrides': overrides,
         'protected_compatible_constructor_aliases': [hex(a) for a in constructors],
         'nondeleting_destructor': hex(entries[0]),
         'get_meta_class': hex(entries[7]),
