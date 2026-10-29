@@ -124,7 +124,7 @@ def main():
                 continue
             for j in range(i + 4, min(i + 16, 36), 4):
                 second = int.from_bytes(code[j:j + 4], 'little')
-                if second & 0xffc003ff == 0x91000000:
+                if second & 0xffc00000 == 0x91000000:
                     return adrp_target(getter + i, word) + ((second >> 10) & 4095)
         return None
 
@@ -142,13 +142,14 @@ def main():
             data = raw[section['fileoff']:section['fileoff'] + section['size']]
             for at in range(0, len(data) - VIRTUAL_ENTRIES * 8 + 1, 8):
                 window = data[at:at + VIRTUAL_ENTRIES * 8]
-                if window[0:8] == base[0:8] or window[56:64] == base[56:64]:
+                if (window[16:56] != base[16:56] or window[0:8] == base[0:8]
+                        or window[56:64] == base[56:64]):
                     continue
                 if not (executable(int.from_bytes(window[0:8], 'little')) and
                         executable(int.from_bytes(window[56:64], 'little'))):
                     continue
                 candidates.append(section['va'] + at)
-    print(f'vtable candidates (0 and 7 overridden, both executable): {len(candidates)}')
+    print(f'vtable candidates (slots 2..6 as IOService, 0/7 overridden, both executable): {len(candidates)}')
     print('  ' + ', '.join(hex(c) for c in candidates[:24]) + (' ...' if len(candidates) > 24 else ''))
     require(candidates, 'no vtable candidate found')
 
@@ -158,8 +159,11 @@ def main():
     # address and references the class-name string.
     metas = {}
     for table in candidates:
-        getter = qword(table + 16 + 7 * 8)
-        metas[table] = getter_target(getter)
+        try:
+            getter = qword(table + 16 + 7 * 8)
+            metas[table] = getter_target(getter)
+        except SystemExit:
+            metas[table] = None
     targets = set(string_vas) | {m for m in metas.values() if m}
     hits = {t: [] for t in targets}
     for segment in image['segments']:
@@ -174,7 +178,7 @@ def main():
             base_va = adrp_target(va + at, word)
             for j in range(at + 4, at + 20, 4):
                 second = int.from_bytes(data[j:j + 4], 'little')
-                if second & 0xffc003ff == 0x91000000:
+                if second & 0xffc00000 == 0x91000000:
                     target = base_va + ((second >> 10) & 4095)
                     if target in hits:
                         hits[target].append(va + at)
