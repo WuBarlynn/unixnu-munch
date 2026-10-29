@@ -90,21 +90,10 @@ for source in sources:
     objects.append(obj)
 archive = out / 'libAdreno740.a'
 archive.unlink(missing_ok=True)
-subprocess.run(['xcrun', 'ar', 'rcs', archive, *objects], check=True)
-# Every NativeAdreno or kit symbol the objects use must be defined by them; the rest is the kernel's.
-nm = subprocess.run(['xcrun', 'nm', '-gP', archive], capture_output=True, text=True, check=True).stdout.splitlines()
-defined = {f.split()[0] for f in nm if len(f.split()) > 1 and f.split()[1] in 'TSDBC'}
-undefined = {f.split()[0] for f in nm if len(f.split()) > 1 and f.split()[1] == 'U'}
-missing = sorted(s for s in undefined - defined if re.search(r'NativeAdreno|native_adreno|ArmSmmu4K|AdrenoPM4|AdrenoHfi|AdrenoFirmware|A650Gmu|Sheng', s))
-if missing:
-    sys.exit('NativeAdreno symbols used but not built here: ' + ', '.join(missing))
-required = ('_NativeAdrenoGpuContextBringup', '_NativeAdrenoGpuContextBuffers', '_NativeAdrenoGpuContextVm', '_native_adreno_publish',
-            '_ArmSmmu4KAttachStreams', '_AdrenoPM4Type7', '_NativeAdrenoGmuContextBringupRoutes', '_NativeAdrenoGmuContextPayloads',
-            '_A650GmuColdStart', '_A650GmuBuildStartup')
-absent = [s for s in required if s not in defined]
-if absent:
-    sys.exit('Required definitions absent: ' + ', '.join(absent))
-print('PASS: %d NativeAdreno a650 objects archived' % len(objects))
+# The accelerator's plain object must not be linked: its __mod_init_func would register the
+# class before the original IOGPUFamily kext exists. Only the staged late object below goes in.
+archived = [obj for obj in objects if not (accelerator.is_file() and obj.name == 'NativeAdrenoAccelerator.o')]
+subprocess.run(['xcrun', 'ar', 'rcs', archive, *archived], check=True)
 
 if accelerator.is_file():
     # The accelerator imports the original base's constructor, destructor and metaclass by
@@ -130,3 +119,19 @@ if accelerator.is_file():
          str(out / 'NativeAdrenoAccelerator.o'), str(late)])
     run(['xcrun', 'ar', 'rcs', str(archive), str(late), str(out / 'original-bindings.o')])
     print('PASS: staged AGXAccelerator appended with bindings', {k: hex(v) for k, v in bindings.items()})
+
+# Every NativeAdreno or kit symbol the objects use must be defined by them; the rest is the kernel's.
+nm = subprocess.run(['xcrun', 'nm', '-gP', archive], capture_output=True, text=True, check=True).stdout.splitlines()
+defined = {f.split()[0] for f in nm if len(f.split()) > 1 and f.split()[1] in 'TSDBC'}
+undefined = {f.split()[0] for f in nm if len(f.split()) > 1 and f.split()[1] == 'U'}
+missing = sorted(s for s in undefined - defined if re.search(r'NativeAdreno|native_adreno|ArmSmmu4K|AdrenoPM4|AdrenoHfi|AdrenoFirmware|A650Gmu|Sheng', s))
+if missing:
+    sys.exit('NativeAdreno symbols used but not built here: ' + ', '.join(missing))
+required = ('_NativeAdrenoGpuContextBringup', '_NativeAdrenoGpuContextBuffers', '_NativeAdrenoGpuContextVm', '_native_adreno_publish',
+            '_ArmSmmu4KAttachStreams', '_AdrenoPM4Type7', '_NativeAdrenoGmuContextBringupRoutes', '_NativeAdrenoGmuContextPayloads',
+            '_A650GmuColdStart', '_A650GmuBuildStartup')
+absent = [s for s in required if s not in defined]
+if absent:
+    sys.exit('Required definitions absent: ' + ', '.join(absent))
+print('PASS: %d NativeAdreno a650 objects archived' % len(objects))
+
