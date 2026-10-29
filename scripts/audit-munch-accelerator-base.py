@@ -50,6 +50,7 @@ def main():
     out = Path(sys.argv[2]) if len(sys.argv) > 2 else ROOT / 'build/gpu-analysis/ioaccelerator-base-abi.json'
     raw = kernel.read_bytes()
     image = macho(raw)
+    print('segments: ' + ', '.join(f"{s['name']}@0x{s['va']:x}+0x{s['filesize']:x}" for s in image['segments']))
     names = {}
     for address, group in exports(raw, image).items():
         for name in group:
@@ -156,7 +157,7 @@ def main():
     # materialised in code. So the class name gives the metaclass, not the other way round.
     metaclass_candidates = set()
     for segment in image['segments']:
-        if segment['name'] not in ('__TEXT', '__TEXT_EXEC'):
+        if 'TEXT' not in segment['name']:
             continue
         data = raw[segment['fileoff']:segment['fileoff'] + segment['filesize']]
         va = segment['va']
@@ -188,7 +189,7 @@ def main():
         page = string_va & ~0xfff
         refs = []
         for segment in image['segments']:
-            if segment['name'] not in ('__TEXT', '__TEXT_EXEC'):
+            if 'TEXT' not in segment['name']:
                 continue
             data = raw[segment['fileoff']:segment['fileoff'] + segment['filesize']]
             va = segment['va']
@@ -212,7 +213,7 @@ def main():
           ', '.join(hex(v) for v in sorted(metaclass_candidates)))
     require(metaclass_candidates, 'no metaclass candidate near a class-name reference')
     text_ranges = [(s['va'], s['va'] + s['filesize']) for s in image['segments']
-                   if s['name'] in ('__TEXT', '__TEXT_EXEC')]
+                   if 'TEXT' in s['name']]
 
     def executable(address):
         return any(lo <= address < hi for lo, hi in text_ranges)
@@ -278,7 +279,7 @@ def main():
 
     constructors = []
     for segment in image['segments']:
-        if segment['name'] not in ('__TEXT', '__TEXT_EXEC'):
+        if 'TEXT' not in segment['name']:
             continue
         data = raw[segment['fileoff']:segment['fileoff'] + segment['filesize']]
         va = segment['va']
