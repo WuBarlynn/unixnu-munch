@@ -25,7 +25,12 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'kits/XnuPrelink'))
+# In the generated tree the kit is a component link; the device repository keeps its kits
+# beside the UniXNU checkout, so the same script also runs straight from the checkout.
+for kit in (ROOT / 'kits/XnuPrelink', ROOT.parent / 'UniXNU/kits/XnuPrelink'):
+    if (kit / 'native_prelink.py').is_file():
+        sys.path.insert(0, str(kit))
+        break
 from native_prelink import macho, exports
 
 INSTANCE_BYTES = 136
