@@ -117,16 +117,33 @@ def main():
         return (pc & ~0xfff) + imm
 
     def getter_target(getter):
-        code = backed(getter, 40)
-        for i in range(0, 36, 4):
+        # getMetaClass returns the address of the class's gMetaClass object. The compiler
+        # either computes it with adrp/add or, when it constant-folds, materializes it with
+        # movz/movk; both forms are decoded here and the register is tracked.
+        code = backed(getter, 64)
+        constant, register = None, None
+        for i in range(0, 60, 4):
             word = int.from_bytes(code[i:i + 4], 'little')
-            if word & 0x9f00001f != 0x90000000:
+            if word & 0x9f00001f == 0x90000000:
+                page, rd = adrp_target(getter + i, word), word & 0x1f
+                for j in range(i + 4, min(i + 20, 60), 4):
+                    second = int.from_bytes(code[j:j + 4], 'little')
+                    if second & 0xffc00000 == 0x91000000 and (second >> 5) & 0x1f == rd:
+                        return page + ((second >> 10) & 4095)
+                constant, register = page, rd
                 continue
-            for j in range(i + 4, min(i + 16, 36), 4):
-                second = int.from_bytes(code[j:j + 4], 'little')
-                if second & 0xffc00000 == 0x91000000:
-                    return adrp_target(getter + i, word) + ((second >> 10) & 4095)
-        return None
+            if word & 0xff800000 == 0xd2800000:            # movz xN, #imm16, lsl #hw
+                register = word & 0x1f
+                constant = ((word >> 5) & 0xffff) << (16 * ((word >> 21) & 3))
+                continue
+            if word & 0xff800000 == 0xf2800000:            # movk xN, #imm16, lsl #hw
+                if register is not None and (word & 0x1f) == register:
+                    shift = 16 * ((word >> 21) & 3)
+                    constant = (constant & ~(0xffff << shift)) | (((word >> 5) & 0xffff) << shift)
+                continue
+            if word == 0xd65f03c0 and constant is not None:  # ret
+                return constant
+        return constant
 
     text_ranges = [(s['va'], s['va'] + s['filesize']) for s in image['segments']
                    if s['name'] == '__TEXT_EXEC']
@@ -158,12 +175,20 @@ def main():
     # candidate belongs to IOAcceleratorES when one function both computes the metaclass
     # address and references the class-name string.
     metas = {}
+    unreadable = 0
     for table in candidates:
         try:
             getter = qword(table + 16 + 7 * 8)
             metas[table] = getter_target(getter)
         except SystemExit:
             metas[table] = None
+        if metas[table] is None and unreadable < 3:
+            unreadable += 1
+            try:
+                print(f'  getter of {table:#x} at {qword(table + 16 + 7 * 8):#x}: '
+                      f'no address materialised; first words ' + backed(qword(table + 16 + 7 * 8), 32).hex())
+            except SystemExit:
+                print(f'  getter of {table:#x}: unbacked')
     targets = set(string_vas) | {m for m in metas.values() if m}
     hits = {t: [] for t in targets}
     for segment in image['segments']:
