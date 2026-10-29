@@ -4,13 +4,13 @@
 The prelink strips IOGPUFamily's symbols, so nothing can be looked up by name.
 The class is located by the facts that do not depend on any private layout:
 
-  * the candidate vtables are the 168-entry tables that override both slot 0
-    and slot 7 to executable code; slot 0 is the non-deleting destructor and
-    slot 7 is getMetaClass, whose body computes the metaclass object, so the
-    metaclass address comes from that code rather than a guessed field offset;
-  * the class is tied to a candidate because one function both computes the
-    metaclass address and references the class-name string (the prelink strips
-    the symbols and this kernel stores the name in code, not in data);
+  * code that computes the class-name string also computes the class's
+    metaclass object (the constructor passes both to OSMetaClass), so the name
+    string gives the metaclass candidates -- this kernel stores no data pointer
+    to the name;
+  * the candidate vtable is the 168-entry table that matches IOService's own
+    except at slots 0 and 7, whose slot 7 getMetaClass returns one of those
+    metaclass addresses. Slot 0 is the non-deleting destructor.
   * the constructors are the bodies that install that vptr in [x0], call
     IOService's C2 and return through the ordinary frame epilogue.
 
@@ -145,6 +145,46 @@ def main():
                 return constant
         return constant
 
+    data_ranges = [(s['va'], s['va'] + s['filesize']) for s in image['segments']
+                    if s['name'] in ('__DATA', '__DATA_CONST', '__const')]
+
+    def is_data(address):
+        return any(lo <= address < hi for lo, hi in data_ranges)
+
+    # The metaclass object is what the class's constructor code computes together with the
+    # class-name string: no data word points at the string in this kernel, the name is
+    # materialised in code. So the class name gives the metaclass, not the other way round.
+    metaclass_candidates = set()
+    for segment in image['segments']:
+        if segment['name'] != '__TEXT_EXEC':
+            continue
+        data = raw[segment['fileoff']:segment['fileoff'] + segment['filesize']]
+        va = segment['va']
+        for at in range(0, len(data) - 24, 4):
+            word = int.from_bytes(data[at:at + 4], 'little')
+            if word & 0x9f00001f == 0x90000000:
+                page = adrp_target(va + at, word)
+                for j in range(at + 4, min(at + 24, len(data) - 4), 4):
+                    second = int.from_bytes(data[j:j + 4], 'little')
+                    if second & 0xffc00000 == 0x91000000:
+                        target = page + ((second >> 10) & 4095)
+                        if target in string_vas:
+                            # The constructor function references the metaclass nearby.
+                            lo, hi = max(0, at - 192), min(len(data) - 24, at + 192)
+                            for k in range(lo, hi, 4):
+                                w2 = int.from_bytes(data[k:k + 4], 'little')
+                                if w2 & 0x9f00001f == 0x90000000:
+                                    page2 = adrp_target(va + k, w2)
+                                    for m in range(k + 4, min(k + 24, len(data) - 4), 4):
+                                        s2 = int.from_bytes(data[m:m + 4], 'little')
+                                        if s2 & 0xffc00000 == 0x91000000:
+                                            t2 = page2 + ((s2 >> 10) & 4095)
+                                            if is_data(t2) and t2 not in string_vas:
+                                                metaclass_candidates.add(t2)
+                        break
+    print('metaclass candidates from class-name references: ' +
+          ', '.join(hex(v) for v in sorted(metaclass_candidates)))
+    require(metaclass_candidates, 'no metaclass candidate near a class-name reference')
     text_ranges = [(s['va'], s['va'] + s['filesize']) for s in image['segments']
                    if s['name'] == '__TEXT_EXEC']
 
@@ -159,8 +199,8 @@ def main():
             data = raw[section['fileoff']:section['fileoff'] + section['size']]
             for at in range(0, len(data) - VIRTUAL_ENTRIES * 8 + 1, 8):
                 window = data[at:at + VIRTUAL_ENTRIES * 8]
-                if (window[16:56] != base[16:56] or window[0:8] == base[0:8]
-                        or window[56:64] == base[56:64]):
+                if (window[16:56] != base[16:56] or window[64:] != base[64:]
+                        or window[0:8] == base[0:8] or window[56:64] == base[56:64]):
                     continue
                 if not (executable(int.from_bytes(window[0:8], 'little')) and
                         executable(int.from_bytes(window[56:64], 'little'))):
@@ -189,32 +229,13 @@ def main():
                       f'no address materialised; first words ' + backed(qword(table + 16 + 7 * 8), 32).hex())
             except SystemExit:
                 print(f'  getter of {table:#x}: unbacked')
-    targets = set(string_vas) | {m for m in metas.values() if m}
-    hits = {t: [] for t in targets}
-    for segment in image['segments']:
-        if segment['name'] != '__TEXT_EXEC':
-            continue
-        data = raw[segment['fileoff']:segment['fileoff'] + segment['filesize']]
-        va = segment['va']
-        for at in range(0, len(data) - 24, 4):
-            word = int.from_bytes(data[at:at + 4], 'little')
-            if word & 0x9f00001f != 0x90000000:
-                continue
-            base_va = adrp_target(va + at, word)
-            for j in range(at + 4, at + 20, 4):
-                second = int.from_bytes(data[j:j + 4], 'little')
-                if second & 0xffc00000 == 0x91000000:
-                    target = base_va + ((second >> 10) & 4095)
-                    if target in hits:
-                        hits[target].append(va + at)
     named = []
     for table, meta in metas.items():
-        refs = hits.get(meta, []) if meta else []
-        strings = [s for s in string_vas if any(abs(pc - r) <= 128 for r in refs for pc in hits.get(s, []))]
-        print(f'  table {table:#x}: metaclass {meta if meta is None else hex(meta)}, '
-              f'{len(refs)} code reference(s), class-name match: {[hex(s) for s in strings]}')
-        if strings:
-            named.append((table, meta, strings[0]))
+        print(f'  table {table:#x}: slot7 getter returns '
+              f'{meta if meta is None else hex(meta)}, '
+              f'class-name candidate: {bool(meta) and meta in metaclass_candidates}')
+        if meta and meta in metaclass_candidates:
+            named.append((table, meta, None))
     require(len(named) == 1, f'expected one candidate tied to the class name, found {len(named)}')
     vptr, metaclass, named_string = named[0]
     entries = [qword(vptr + 16 + i * 8) for i in range(VIRTUAL_ENTRIES)]
