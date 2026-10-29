@@ -153,31 +153,34 @@ components = ["Adreno650"]
 paths = ["package/*Gpu*", "package/*Gmu*", "package/*Adreno*", "kits/pipa/*", "scripts/*adreno*", "scripts/*gpu*", "scripts/*metal*", "scripts/*turnip*", "scripts/*air*"]
 inputs = [
   "Adreno 650 on SM8250-AC; chip id 0x06050002; blocks GPU 0x3d00000, GMU 0x3d6a000, GPUCC 0x3d90000, SMMU 0x3da0000.",
-  "Firmware already embedded in package/GpuFirmwareA650.c: gmu 41548 B, sqe 31632 B, zap.mdt 6860 B + zap.b02 1676 B, concatenated for the probe's single zap image.",
+  "Firmware in package/GpuFirmwareA650.c, from the phone's own vendor partition: gmu 41548 B and sqe 31632 B (byte-identical to the earlier dump), zap.mdt 6860 B + zap.b02 1676 B (8536 B, the vendor image; the K40 dump differed in 787 bytes and TrustZone refused it). The vendor files are kept in _dump/zapvendor/.",
   "The pipa fork's A650 driver (reference/repo/Adreno650) is the same generation as this board; the upstream Adreno740 is not.",
 ]
 configuration = [
   "board.toml passes pipa-gpu=<mode>; CONFIG_XNU_NATIVE_ADRENO=y links the archive, which must be produced at build/adreno740/libAdreno740.a because build-xnu-4k-baseline.sh hard-codes that name and ignores CONFIG_XNU_NATIVE_ADRENO_ARCHIVE.",
   "CONFIG_XNU_NATIVE_ADRENO_ARCHIVE uses the {tree} token so the path is absolute and satisfies both the checkout-rooted check in scripts/unixnu/kernel.py and the tree-rooted check in the shell script.",
-  "Mode 12 (the Metal accelerator) is compiled out with PIPA_GPU_ACCELERATOR=0: the accelerator is an IOAccelerator subclass and this kernel has no IOAccelerator class (IOAcceleratorFamily2 is absent).",
+  "Mode 12 (the Metal accelerator) is compiled out with PIPA_GPU_ACCELERATOR=0. IOAcceleratorFamily2 is absent from the prelinked kernel, but this OS generation's accelerator base is IOAcceleratorES and both IOGPUFamily and IOAcceleratorES are present; enabling it needs a runtime ABI audit of that class on this kernel, which audit-target-accelerator-base.py currently binds to sheng's observation.",
+  "The zap metadata follows Linux mdt_loader for split firmware: the ELF header directly followed by the hash segment, no padding; the program headers keep the signed padded offsets (0x1000, 0x3000). The firmware array stores mdt+b02 densely (hash at 148, code at 6860).",
 ]
 procedure = [
   "Build with --local-module driver:Adreno650=<checkout>, ADRENO650_DRIVER, ADRENO650_KITS and ADRENO650_PACKAGE set; the kits and the driver are not in the generated tree because Adreno650 is not in UniXNU's catalogue.",
   "Boot with pipa-gpu=<n> and read the GPUROW lines on the console; native_gpu_rows is not rendered by this board's page.",
 ]
 findings = [
-  "Mode 1 (read only) runs: GPU m1 gcc=ok cc=ok smmu=skip gpu=skip io=0.",
-  "Mode 6 powers the GPU: GPU m6 gcc=ok cc=ok smmu=ok io=0 cx1 clocks1 — the CX domain comes out of collapse and the SMMU/GMU clocks run.",
-  "Mode 7 stops at the GMU context's Attach step: status e00002ca, routes 0, programme phase 5 with 13 writes issued and no global fault.",
-  "Two writes to the SMMU, each with a value different from the one present, are accepted and do not take effect: SMR slot 5 0x8000007f reads back 0, sCR0 0x0026040e reads back 0x00260406. Reads through the same mapping are correct (IDR0 0x4c017e06) and GPUCC writes through an identically constructed window do take effect. The readable, silently unwritable register file is what a resource owned above EL1 looks like.",
+  "Mode 1 (read only) runs and mode 6 brings the CX domain and the SMMU/GMU clocks out of collapse: GPU m6 gcc=ok cc=ok smmu=ok cx1 clocks1.",
+  "Mode 7 builds the GMU SMMU context and cold-starts the GMU: GMUCTX step 7 status 0 routes 2, LOAD phase 8 ready 11, HFI acked c6. The earlier e00002ca/routes 0 refusal was the ArmSmmu4K FAULT-S2CR rule (unused slots read 0x000203ff with CBNDX 0xff); the pipa branch (9fbc33a) checks only the type.",
+  "Mode 8 powers GX through the GMU: GX on perf 7 vote 0 gx c0>0, OOB two polls.",
+  "Mode 9 builds the GPU's own SMMU context (routes 4), starts the SQE, CP_ME_INIT and ring 0, and the ring's CP_MEM_WRITE lands marker 0xa6500c0d in the scratch page with the ring drained and no hardware fault.",
+  "Mode 10 authenticates the vendor zap (init/mem/auth 0, secure-mode exit fenced) and takes the GPU interrupt: SPI 332 attached, a CP_NOP fence raises it.",
+  "Mode 11 publishes the device and runs both user-client rounds: PUBLISH ok submit 0 timer 0 publish 0, uc 36/36, rounds 4 4.",
 ]
 completion = ["GPU submissions complete, mapping/fence handling is correct, a known image renders, and the selected Metal client presents it."]
 limits = [
-  "The GMU context cannot be built because this SMMU accepts no writes from EL1; every later step depends on it.",
-  "Metal is unreachable for the same reason plus the missing IOAccelerator class, so the wallpaper overlay and poster rendering stay on the CPU path.",
+  "The kernel path is complete through user clients; what the kernel does not do yet is accelerate the UI: mode 12 needs the staged AGXAccelerator built against this kernel's IOAcceleratorES ABI, the AdrenoMetal plugin and the Turnip/metal2vulkan addon with the owner trust module.",
+  "The desktop and the wallpaper overlay still render on the CPU.",
 ]
-next_action = ["Decide the route past the SMMU's EL1 write refusal: an EL2-side channel, a presentation path that needs no SMMU programming, or accepting CPU presentation on this board."]
-evidence = [{ kind = "device", command = "sh scripts/run-sheng-unattended.sh <boot.img> 180, then read GPUROW lines from the console capture of that run", revision = "002ccaa75267bcc70ea1ba97dfefea14c6f7211d", reference = "docs/evidence/2026-10-28-gpu-wifi-bringup.md", result = "Mode 1 reads and mode 6 powers the CX domain with the SMMU and GMU clocks running: gcc=ok cc=ok smmu=ok cx1 clocks1." }, { kind = "device", command = "boot a pipa-gpu=7 image and read the GPUROW14 line from the console capture", revision = "e240b0e810988bf1012b2aa37bd3ae4fd6d84e67", reference = "docs/evidence/2026-10-28-gpu-wifi-bringup.md", result = "Writes to SMR slot 5 (0x8000007f) and sCR0 (0x0026040e) both read back the pre-existing value while IDR0 reads 0x4c017e06 through the same window." }]
+next_action = ["Audit IOAcceleratorES on this kernel (runtime observation, as sheng did), build the accelerator against it, then stage the Metal plugin and the GPU addon."]
+evidence = [{ kind = "device", command = "build-local.sh, boot with fastboot, read the GPUROW lines from the USB console capture", revision = "mun-b9 (device repository 5b4f7ed)", reference = "docs/evidence/2026-10-29-gpu-modes-8-11.md", result = "Modes 7 to 11 pass on the phone: GMUCTX status 0 routes 2, GX on, CP marker 0xa6500c0d, ZAP ok init/mem/auth 0 with the vendor image, IRQ attach 0 count 1>2, PUBLISH ok uc 36/36." }]
 
 [[area]]
 id = "network"
