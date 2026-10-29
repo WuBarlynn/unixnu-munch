@@ -156,7 +156,7 @@ def main():
     # materialised in code. So the class name gives the metaclass, not the other way round.
     metaclass_candidates = set()
     for segment in image['segments']:
-        if segment['name'] != '__TEXT_EXEC':
+        if segment['name'] not in ('__TEXT', '__TEXT_EXEC'):
             continue
         data = raw[segment['fileoff']:segment['fileoff'] + segment['filesize']]
         va = segment['va']
@@ -182,11 +182,37 @@ def main():
                                             if is_data(t2) and t2 not in string_vas:
                                                 metaclass_candidates.add(t2)
                         break
+    # How the code reaches the strings at all: every adrp/add target in the same 4 KiB page
+    # as a class-name occurrence, so a different reference form or a different copy shows.
+    for string_va in string_vas:
+        page = string_va & ~0xfff
+        refs = []
+        for segment in image['segments']:
+            if segment['name'] not in ('__TEXT', '__TEXT_EXEC'):
+                continue
+            data = raw[segment['fileoff']:segment['fileoff'] + segment['filesize']]
+            va = segment['va']
+            for at in range(0, len(data) - 24, 4):
+                word = int.from_bytes(data[at:at + 4], 'little')
+                if word & 0x9f00001f != 0x90000000:
+                    continue
+                page_base = adrp_target(va + at, word)
+                if page_base != page:
+                    continue
+                for j in range(at + 4, min(at + 24, len(data) - 4), 4):
+                    second = int.from_bytes(data[j:j + 4], 'little')
+                    if second & 0xffc00000 == 0x91000000:
+                        target = page_base + ((second >> 10) & 4095)
+                        if page <= target < page + 0x1000:
+                            refs.append((va + at, target))
+                        break
+        print(f'  string {string_va:#x}: {len(refs)} reference(s) into its page' +
+              ('' if not refs else ': ' + ', '.join(f'{pc:#x}->{target - string_va:+#x}' for pc, target in refs[:8])))
     print('metaclass candidates from class-name references: ' +
           ', '.join(hex(v) for v in sorted(metaclass_candidates)))
     require(metaclass_candidates, 'no metaclass candidate near a class-name reference')
     text_ranges = [(s['va'], s['va'] + s['filesize']) for s in image['segments']
-                   if s['name'] == '__TEXT_EXEC']
+                   if s['name'] in ('__TEXT', '__TEXT_EXEC')]
 
     def executable(address):
         return any(lo <= address < hi for lo, hi in text_ranges)
@@ -252,7 +278,7 @@ def main():
 
     constructors = []
     for segment in image['segments']:
-        if segment['name'] != '__TEXT_EXEC':
+        if segment['name'] not in ('__TEXT', '__TEXT_EXEC'):
             continue
         data = raw[segment['fileoff']:segment['fileoff'] + segment['filesize']]
         va = segment['va']
